@@ -4,9 +4,104 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from pypdf import PdfReader
 import numpy as np
+import json
+import hashlib
+from pathlib import Path
+
 load_dotenv()  # Load environment variables from .env file
 
+
 #PDF Text extraction
+
+def extract_pdf_urls(pdf_path: str) -> list[str]:
+    """
+    Extracts hyperlink URLs stored as PDF annotations (/Annots with /A /URI).
+    Returns a de-duplicated list of URLs.
+    """
+    reader = PdfReader(pdf_path)
+    urls = []
+
+    for page in reader.pages:
+        annots = page.get("/Annots")
+        if not annots:
+            continue
+
+        for annot_ref in annots:
+            try:
+                annot = annot_ref.get_object()
+                action = annot.get("/A")
+                if action and action.get("/S") == "/URI":
+                    uri = action.get("/URI")
+                    if uri:
+                        urls.append(str(uri))
+            except Exception:
+                # Some PDFs have weird/unsupported annotation structures
+                continue
+
+    # de-duplicate while preserving order
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+#It generates a unique fingerprint of a file based on its contents.
+def file_sha256(path:str)->str:
+    h=hashlib.sha256()
+    with open(path,"rb") as f:
+        for block in iter(lambda:f.read(1024*1024),b""):
+            h.update(block)
+    return h.hexdigest()
+
+# .
+def cache_paths(pdf_path:str)->tuple[Path,Path]:
+    """
+    Stores cache next to your script in a .cache folder.
+    One cache per PDF file (based on pdf file hash).
+    """
+    cache_dir=Path(".cache")
+    cache_dir.mkdir(exist_ok=True)
+    pdf_hash=file_sha256(pdf_path)[:16]
+    base=cache_dir/f"pdf_{pdf_hash}"
+    # .json → store text chunks
+    # .npy → store embedding vectors
+    return base.with_suffix(".json"),base.with_suffix(".npy")
+
+def load_embedding_cache(
+        meta_path:Path,
+        vecs_path:Path,
+        expected_fingerprint:str
+)->tuple[list[str],np.ndarray] | None:
+    if not meta_path.exists() or not vecs_path.exists():
+        return None
+    try:
+        meta=json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("fingerprint")!=expected_fingerprint:
+            return None
+        chunks=meta["chunks"]
+        vecs=np.load(vecs_path)
+        return chunks,vecs
+    except Exception:
+        return None
+
+def save_embedding_cache(
+    meta_path: Path,
+    vecs_path: Path,
+    fingerprint: str,
+    chunks: list[str],
+    vecs: np.ndarray
+) -> None:
+    meta = {
+        "fingerprint": fingerprint,
+        "chunks": chunks,
+        "num_chunks": len(chunks),
+        "embedding_dim": int(vecs.shape[1]) if vecs.ndim == 2 else None,
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    np.save(vecs_path, vecs)
+    
 
 def extract_pdf_text(pdf_path: str) -> str:
     reader=PdfReader(pdf_path)
@@ -131,10 +226,31 @@ def main():
 
     print("\nReading PDF...")
     text = extract_pdf_text(pdf_path)
+    urls = extract_pdf_urls(pdf_path)
+    if urls:
+        text += "\n\nLINKS FOUND IN PDF:\n" + "\n".join(urls)
+
     if not text:
         raise SystemExit("Could not extract text from this PDF (it may be scanned images).")
 
     chunks = chunk_text(text, max_chars=1200, overlap=150)
+    meta_path, vecs_path = cache_paths(pdf_path)
+    fingerprint = "|".join([
+    "v1",  # bump this if you change cache format
+    file_sha256(pdf_path),
+    embedding_model,
+    str(1200),   # max_chars used for chunking (keep in sync)
+    str(150),    # overlap used for chunking (keep in sync)
+    ])
+    cached = load_embedding_cache(meta_path, vecs_path, fingerprint)
+    if cached is not None:
+        chunks, chunk_vecs = cached
+        print(f"Loaded cached embeddings: {len(chunks)} chunks")
+    else:
+        print("No valid cache found. Creating embeddings...")
+        chunk_vecs = embed_texts(client, chunks, embedding_model)
+        save_embedding_cache(meta_path, vecs_path, fingerprint, chunks, chunk_vecs)
+        print(f"Saved embeddings cache: {len(chunks)} chunks")
     if not chunks:
         raise SystemExit("No chunks created; PDF text seems empty.")
 
